@@ -1,0 +1,122 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HAR to Splunk APM Trace Report</title>
+    <!-- JSZip for handling zip files -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background-color: #f9f9f9; color: #333; }
+        h1 { border-bottom: 2px solid #ddd; padding-bottom: 10px; color: #111; display: flex; justify-content: space-between; align-items: center; }
+
+        .top-controls { display: flex; gap: 10px; align-items: center; font-size: 14px; font-weight: normal;}
+        .top-controls select { padding: 6px; border-radius: 4px; border: 1px solid #ccc; max-width: 300px;}
+
+        .file-controls input[type="file"] { display: none; }
+        .btn-upload { padding: 6px 12px; background-color: #007acc; color: white; border-radius: 4px; cursor: pointer; border: none; font-size: 14px; display: inline-block; }
+        .btn-upload:hover { background-color: #005a9c; }
+
+        /* Metadata Panel */
+        .metadata-panel { background-color: #eef6fb; border: 1px solid #cce4f7; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; font-size: 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+        .meta-item strong { display: block; color: #555; font-size: 12px; text-transform: uppercase; margin-bottom: 2px; }
+
+        /* Filter Box */
+        .filter-box { background-color: #fff; padding: 15px 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 20px; }
+        .filter-box div { flex: 1; min-width: 200px; }
+        .filter-box label { display: block; font-weight: 500; margin-bottom: 5px; font-size: 14px; }
+        .filter-box input { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+
+        /* Table */
+        table { width: 100%; table-layout:fixed; border-collapse: collapse; box-shadow: 0 2px 8px rgba(0,0,0,0.05); background-color: #fff; }
+        th, td { border: 1px solid #ddd; padding: 12px 15px; text-align: left; word-break: break-all; font-size: 14px; }
+        th { background-color: #f2f2f2; font-weight: 600; }
+
+        /* Specific column widths */
+        .row-number { color: #888; font-size: 12px; width: 40px; text-align: center; vertical-align: top; padding-top: 15px; }
+
+        .source-url-cell { vertical-align: top; width: 40%; border-top: 3px solid #007acc; }
+        .source-url-cell .url-text { font-weight: 500; color: #005a9c; }
+        .trace-group-master .trace-url-cell { border-top: 3px solid #007acc; }
+        .trace-url-cell { vertical-align: top; width: 60%; }
+
+        .slow-trace { background-color: #fff0f5; } /* Light Pink */
+        .id-link, .har-timing, .cache-control { font-family: monospace; display: inline-block; margin-top: 8px; font-size: 13px; color: #333; }
+
+        /* New Styles for HAR Timing thresholds */
+        .har-timing.timing-warn { background-color: #fff176; padding: 2px 4px; border-radius: 4px; } /* Yellow */
+        .har-timing.timing-crit { background-color: #d32f2f; color: white; padding: 2px 4px; border-radius: 4px; } /* Red */
+
+        /* New Styles for Cache Control text */
+        .cache-text-red { color: #d32f2f; font-weight: bold; }
+        .cache-text-orange { color: #f57c00; font-weight: bold; }
+
+        .method-tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 12px; font-weight: 700; margin-right: 8px; color: #fff; font-family: monospace; vertical-align: middle; }
+        .method-GET { background-color: #007bc0; }
+        .method-POST { background-color: #009e60; }
+        .method-PUT { background-color: #f0a300; }
+        .method-DELETE { background-color: #d92027; }
+        .method-PATCH { background-color: #9c27b0; }
+        .method-OPTIONS { background-color: #607d8b; }
+        .method-N-A { background-color: #9e9e9e; }
+
+        .url-text { display: inline-block; vertical-align: middle; }
+        .duration-tag { font-style: italic; color: #555; font-size: 12px; margin-left: 10px; white-space: nowrap; }
+    </style>
+</head>
+
+<body>
+    <h1>
+        HAR to Splunk APM Trace Report
+        <div class="top-controls">
+            <!-- Dropdown to switch reports inside the ZIP -->
+            <select id="reportSelector" style="display:none;" onchange="switchReport()">
+                <option value="">Select a report...</option>
+            </select>
+
+            <!-- File upload button -->
+            <div class="file-controls">
+                <label for="fileInput" class="btn-upload">Load Data (JS or ZIP)</label>
+                <input type="file" id="fileInput" accept=".js,.json,.zip">
+            </div>
+        </div>
+    </h1>
+
+    <div id="metadata-container" class="metadata-panel" style="display:none;"></div>
+
+    <div class="filter-box">
+        <div>
+            <label for="sourceUrlFilter">Filter Source URL</label>
+            <input type="text" id="sourceUrlFilter" placeholder="Matches any text in Source URL">
+        </div>
+        <div style="flex: 0 0 150px;">
+            <label for="cacheFilter">Filter Cache Header</label>
+            <input type="text" id="cacheFilter" placeholder="e.g., no-cache">
+        </div>
+        <div>
+            <label for="domainFilter">Filter Traced URL (Domain)</label>
+            <input type="text" id="domainFilter" placeholder="e.g., uk-t1-rcs.test.allwyndc.net">
+        </div>
+        <div>
+            <label for="textFilter">Filter Traced URL (Text)</label>
+            <input type="text" id="textFilter" placeholder="Matches any text in Traced URL">
+        </div>
+    </div>
+
+    <table id="reportTable">
+        <thead>
+            <tr>
+                <th style="width: 40px; text-align: center;">#</th>
+                <th>Source URL (from HAR)</th>
+                <th>Traced URLs (from Splunk APM Spans)</th>
+            </tr>
+        </thead>
+        <tbody id="reportBody">
+        </tbody>
+    </table>
+
+    <script src="report-logic.js" defer></script>
+</body>
+</html>
+
