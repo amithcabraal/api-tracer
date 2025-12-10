@@ -1,0 +1,15 @@
+{
+  "name": "har-splunk-tracer",
+  "version": "2.0.0",
+  "description": "Maps multiple HAR files to Splunk APM traces and zips the results",
+  "main": "api-tracer.js",
+  "type": "module",
+  "scripts": {
+    "start": "node api-tracer.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "adm-zip": "^0.5.10"
+  }
+}
+
