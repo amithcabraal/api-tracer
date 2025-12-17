@@ -202,10 +202,16 @@ function renderNetworkGraph() {
         // Tooltip text
         const taskList = taskCount > 0 ? Array.from(taskSet).join('\n') : 'No specific tasks identified';
         
+        let label = serviceName;
+        // Only append task count if > 0, otherwise it looks confusing
+        if (taskCount > 0) {
+            label += `\n(${taskCount} tasks)`;
+        }
+        
         elements.push({
             data: { 
                 id: serviceName, 
-                label: `${serviceName}\n(${taskCount} tasks)`,
+                label: label,
                 tooltip: taskList
             }
         });
