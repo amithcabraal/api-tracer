@@ -158,37 +158,50 @@ function renderNetworkGraph() {
     const container = document.getElementById('networkContainer');
     if (container.style.display === 'none') return;
 
-    const services = new Map(); // serviceName -> Set(taskArns)
-    const edges = new Map(); // "source->target" -> { count, totalDuration }
+    // We want One Node Per Task (Service + TaskArn)
+    // Key: "Service::TaskArn" (or "Service::null" if missing)
+    const taskNodes = new Map(); // Key -> { service, taskArn, id }
+    const edges = new Map(); // "sourceKey->targetKey" -> { count, totalDuration }
+
+    // Helper to generate unique key
+    const getNodeKey = (service, taskArn) => `${service}::${taskArn || 'unknown'}`;
 
     // Aggregate data from all traces in the current report
     currentDataItems.forEach(item => {
         if (!item.graphData) return;
         
-        // Map spanID to its details for this specific trace
-        const spanMap = new Map();
+        // Map spanID to its Node Key for this specific trace
+        const spanToNodeKey = new Map();
+        
         item.graphData.forEach(span => {
-            spanMap.set(span.spanId, span);
+            const key = getNodeKey(span.service, span.taskArn);
+            spanToNodeKey.set(span.spanId, key);
             
-            // Nodes: Collect Service Names and Task ARNs
-            if (!services.has(span.service)) services.set(span.service, new Set());
-            if (span.taskArn) services.get(span.service).add(span.taskArn);
+            // Register Node if new
+            if (!taskNodes.has(key)) {
+                taskNodes.set(key, { 
+                    service: span.service, 
+                    taskArn: span.taskArn
+                });
+            }
         });
 
-        // Edges: Link Parent Service -> Child Service
+        // Edges: Link Parent Node -> Child Node
         item.graphData.forEach(span => {
-            if (span.parentId && spanMap.has(span.parentId)) {
-                const parent = spanMap.get(span.parentId);
-                const source = parent.service;
-                const target = span.service;
+            if (span.parentId && spanToNodeKey.has(span.parentId)) {
+                const sourceKey = spanToNodeKey.get(span.parentId);
+                const targetKey = getNodeKey(span.service, span.taskArn);
                 
-                if (source !== target) {
-                    const key = `${source}->${target}`;
-                    const edgeData = edges.get(key) || { count: 0, totalDuration: 0 };
+                // Allow self-loops if different spans? Usually we ignore service-internal calls for high level graphs,
+                // but for task-level, self-loops might be interesting (intra-task calls). 
+                // Let's filter perfectly identical source/target to keep graph clean unless requested otherwise.
+                if (sourceKey !== targetKey) {
+                    const edgeKey = `${sourceKey}->${targetKey}`;
+                    const edgeData = edges.get(edgeKey) || { count: 0, totalDuration: 0 };
                     
                     edgeData.count++;
                     edgeData.totalDuration += (span.duration || 0); // micros
-                    edges.set(key, edgeData);
+                    edges.set(edgeKey, edgeData);
                 }
             }
         });
@@ -197,22 +210,30 @@ function renderNetworkGraph() {
     const elements = [];
 
     // Create Nodes
-    services.forEach((taskSet, serviceName) => {
-        const taskCount = taskSet.size;
-        // Tooltip text
-        const taskList = taskCount > 0 ? Array.from(taskSet).join('\n') : 'No specific tasks identified';
+    // We need to number tasks per service to give them friendly labels like "Gateway #1", "Gateway #2"
+    const serviceCounters = new Map(); // Service -> count
+
+    taskNodes.forEach((info, key) => {
+        let label = info.service;
         
-        let label = serviceName;
-        // Only append task count if > 0, otherwise it looks confusing
-        if (taskCount > 0) {
-            label += `\n(${taskCount} tasks)`;
+        // Only append counter if we have distinct tasks (i.e. taskArn is not null)
+        // OR if we just want to enumerate unique nodes regardless.
+        // Let's enumerate if we have a taskArn.
+        if (info.taskArn) {
+            const count = (serviceCounters.get(info.service) || 0) + 1;
+            serviceCounters.set(info.service, count);
+            label += ` #${count}`;
+        } else {
+            // For the "null" task bucket, just show Service Name + "?"
+            // Or just Service Name if it's the only one.
+            label += ` (?)`; 
         }
-        
+
         elements.push({
             data: { 
-                id: serviceName, 
+                id: key, 
                 label: label,
-                tooltip: taskList
+                tooltip: info.taskArn || 'Task ARN not found'
             }
         });
     });
@@ -282,7 +303,7 @@ function renderNetworkGraph() {
 
     cy.on('tap', 'node', function(evt){
         const node = evt.target;
-        alert(`Tasks for ${node.id()}:\n\n${node.data('tooltip')}`);
+        alert(`Tasks for ${node.id().split('::')[0]}:\n\n${node.data('tooltip')}`);
     });
 }
 
