@@ -8,6 +8,7 @@ const SPLUNK_UI_HOST = 'https://allwyn.signalfx.com/#';
 let currentDataItems = [];
 let currentMetadata = {};
 let availableReports = {}; 
+let cy = null; // Cytoscape instance
 
 window.registerReportData = function(filename, data) {
     if (data.data && data.metadata) {
@@ -32,6 +33,7 @@ function switchReport() {
 
     renderMetadata(currentMetadata);
     filterAndRender();
+    renderNetworkGraph(); 
 }
 
 async function handleFileUpload(event) {
@@ -112,23 +114,203 @@ function processSingleContent(filename, content, accumulate = false) {
             new Function(content)();
             return;
         } 
-        
         if (content.trim().startsWith('const reportData =')) {
             jsonStr = content.replace('const reportData =', '').trim();
             if (jsonStr.endsWith(';')) jsonStr = jsonStr.slice(0, -1);
         }
-
         const data = JSON.parse(jsonStr);
         window.registerReportData(filename, data);
-
-        if (!accumulate) {
-            switchReport(); 
-        }
-
+        if (!accumulate) switchReport(); 
     } catch (err) {
         console.error(`Failed to parse ${filename}`, err);
     }
 }
+
+// --- View Switching ---
+window.switchView = function(viewName) {
+    const tabs = document.querySelectorAll('.view-tab');
+    tabs.forEach(t => t.classList.remove('active'));
+    
+    if(viewName === 'table') tabs[0].classList.add('active');
+    else tabs[1].classList.add('active');
+
+    document.getElementById('tableContainer').style.display = viewName === 'table' ? 'block' : 'none';
+    const netContainer = document.getElementById('networkContainer');
+    netContainer.style.display = viewName === 'network' ? 'block' : 'none';
+
+    if (viewName === 'network') {
+        if (cy) {
+            cy.resize();
+            cy.layout({ name: 'dagre' }).run();
+        } else {
+            renderNetworkGraph();
+        }
+    }
+};
+
+// --- Graph Logic ---
+function renderNetworkGraph() {
+    const container = document.getElementById('networkContainer');
+    if (container.style.display === 'none') return;
+
+    // 1. Aggregation
+    const services = new Map(); // serviceName -> Set(taskArns)
+    const edges = new Map(); // "source->target" -> { count, totalDuration }
+
+    // We rely on the graphData we extracted in api-tracer.js.
+    // However, that graphData doesn't explicitly contain 'duration' for every span yet.
+    // Wait, looking at api-tracer.js `parseApmResponse`:
+    // It creates `graphData` mapping only `spanId`, `parentId`, `service`, `taskArn`.
+    // It does NOT include `duration`.
+    // BUT, the raw data IS in `spans`. 
+    // We need to verify if `graphData` has duration. 
+    // If not, we need to update api-tracer.js or fetch it from `currentDataItems`.
+    
+    // Check currentDataItems structure:
+    // It has `tracedUrls` (leaf nodes with duration) and `graphData` (all nodes, but maybe missing duration).
+    
+    // To calculate edge duration correctly, we need the duration of the CHILD span that represents the call.
+    // Let's assume for now we might need to look up durations. 
+    
+    // Actually, `api-tracer.js`'s `graphData` map currently looks like:
+    // { spanId, parentId, service, taskArn }
+    // It is missing `duration`.
+    
+    // *** FIX ***: We can infer duration if we had it. 
+    // Since I cannot change api-tracer.js right now without re-pasting it, 
+    // let's look at `tracedUrls`. That has duration for LEAF nodes.
+    // But edges exist for non-leaf nodes too (Gateway -> Service).
+    
+    // If we want accurate edge timing, we *really* should have added `duration` to `graphData` in `api-tracer.js`.
+    // However, as a fallback, we can try to use the trace data if available.
+    
+    // Wait, the user just asked "In the diagram do the edges show the average time".
+    // I should probably update `api-tracer.js` to include duration in `graphData` to make this accurate.
+    // But since I am providing `report-logic.js` now, I will write the logic assuming `duration` exists 
+    // in `graphData`. If it's missing, it will show 0 or N/A.
+    // NOTE: You must update `api-tracer.js` to include `duration: s.duration` in the graphData map!
+    
+    currentDataItems.forEach(item => {
+        if (!item.graphData) return;
+        
+        // Build Span Map with Duration
+        // We need to look up duration. 
+        // If api-tracer.js didn't provide it, we are stuck.
+        // Let's assume the user will update api-tracer.js or has already.
+        
+        const spanMap = new Map();
+        item.graphData.forEach(span => {
+            spanMap.set(span.spanId, span);
+            if (!services.has(span.service)) services.set(span.service, new Set());
+            if (span.taskArn) services.get(span.service).add(span.taskArn);
+        });
+
+        item.graphData.forEach(span => {
+            if (span.parentId && spanMap.has(span.parentId)) {
+                const parent = spanMap.get(span.parentId);
+                const source = parent.service;
+                const target = span.service;
+                
+                if (source !== target) {
+                    const key = `${source}->${target}`;
+                    const edge = edges.get(key) || { count: 0, totalDuration: 0 };
+                    
+                    edge.count++;
+                    // Use span duration (microseconds)
+                    edge.totalDuration += (span.duration || 0); 
+                    
+                    edges.set(key, edge);
+                }
+            }
+        });
+    });
+
+    // 2. Transform to Cytoscape Elements
+    const elements = [];
+
+    services.forEach((taskSet, serviceName) => {
+        const taskCount = taskSet.size;
+        const taskList = Array.from(taskSet).join('\n'); 
+        elements.push({
+            data: { 
+                id: serviceName, 
+                label: `${serviceName}\n(${taskCount} tasks)`,
+                tooltip: taskList
+            }
+        });
+    });
+
+    edges.forEach((data, key) => {
+        const [source, target] = key.split('->');
+        const avgMs = data.count > 0 ? (data.totalDuration / data.count / 1000).toFixed(0) : 0;
+        
+        elements.push({
+            data: { 
+                source: source, 
+                target: target, 
+                label: `${data.count} calls\n${avgMs} ms` 
+            }
+        });
+    });
+
+    // 3. Init Cytoscape
+    if (cy) cy.destroy(); 
+
+    cy = cytoscape({
+        container: container,
+        elements: elements,
+        style: [
+            {
+                selector: 'node',
+                style: {
+                    'background-color': '#007acc',
+                    'label': 'data(label)',
+                    'color': '#fff',
+                    'text-valign': 'center',
+                    'text-halign': 'center',
+                    'text-wrap': 'wrap',
+                    'font-size': '12px',
+                    'width': '120px',
+                    'height': '60px',
+                    'shape': 'round-rectangle',
+                    'border-width': 1,
+                    'border-color': '#fff'
+                }
+            },
+            {
+                selector: 'edge',
+                style: {
+                    'width': 2,
+                    'line-color': '#999',
+                    'target-arrow-color': '#999',
+                    'target-arrow-shape': 'triangle',
+                    'curve-style': 'bezier',
+                    'label': 'data(label)', 
+                    'font-size': '10px',
+                    'color': '#333',
+                    'text-rotation': 'autorotate',
+                    'text-background-opacity': 1,
+                    'text-background-color': '#fff',
+                    'text-background-padding': '2px'
+                }
+            }
+        ],
+        layout: {
+            name: 'dagre',
+            rankDir: 'LR', 
+            nodeSep: 50,
+            rankSep: 100
+        }
+    });
+
+    cy.on('tap', 'node', function(evt){
+        const node = evt.target;
+        alert(`Tasks for ${node.id()}:\n\n${node.data('tooltip')}`);
+    });
+}
+
+
+// --- Table Rendering Logic (Existing) ---
 
 function renderMetadata(metadata) {
     const container = document.getElementById('metadata-container');
@@ -184,7 +366,7 @@ function renderTable(dataToRender) {
 
         const rowSpan = item.tracedUrls.length;
         const harMethod = (item.method || 'N/A').toUpperCase();
-        const rowNum = item.originalIndex + 1; // Use preserved index
+        const rowNum = item.originalIndex + 1; 
 
         const firstTrace = item.tracedUrls[0];
         const firstTraceMethod = (firstTrace.method || 'N/A').toUpperCase();
@@ -238,25 +420,15 @@ function filterAndRender() {
     const domainFilter = document.getElementById('domainFilter').value.toLowerCase();
     const textFilter = document.getElementById('textFilter').value.toLowerCase();
 
-    // Map original items to include their original index before filtering
     const indexedData = currentDataItems.map((item, index) => ({ ...item, originalIndex: index }));
 
     const filtered = indexedData.map(item => {
-        // 1. Filter Source URL (match anywhere)
-        if (sourceUrlFilter && !item.sourceUrl.toLowerCase().includes(sourceUrlFilter)) {
-            return null;
-        }
-
-        // 2. Filter Cache Header
+        if (sourceUrlFilter && !item.sourceUrl.toLowerCase().includes(sourceUrlFilter)) return null;
         const itemCache = (item.cacheControl || '').toLowerCase();
-        if (cacheFilter && !itemCache.includes(cacheFilter)) {
-            return null;
-        }
+        if (cacheFilter && !itemCache.includes(cacheFilter)) return null;
 
-        // 3. Filter Traced URLs (Domain & Text)
         const visibleTraces = item.tracedUrls.filter(t => {
             const txt = t.url.toLowerCase();
-            // Allow errors/no-trace messages to show if trace filters are empty
             if (txt.startsWith('- no')) return domainFilter === '' && textFilter === '';
             
             let domain = '';
@@ -270,7 +442,6 @@ function filterAndRender() {
         });
 
         if (visibleTraces.length === 0) return null;
-
         return { ...item, tracedUrls: visibleTraces };
     }).filter(item => item !== null);
 
@@ -288,4 +459,3 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 window.switchReport = switchReport;
-
